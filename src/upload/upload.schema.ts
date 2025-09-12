@@ -6,10 +6,10 @@ export type UploadDataDocument = UploadData & Document;
 
 @Schema({ timestamps: true })
 export class UploadData {
-    @Prop({ default: () => uuidv4(), unique: true })
+    @Prop({ required: true, unique: true })
     ticketRefId: string;
 
-    @Prop({ required: true })
+    @Prop()
     description: string;
 
     @Prop()
@@ -30,6 +30,4 @@ export class UploadData {
 }
 
 export const UploadDataSchema = SchemaFactory.createForClass(UploadData);
-
-// compound index for faster queries, but not unique (dedupe handled in service)
 UploadDataSchema.index({ description: 1, category: 1, subCategory: 1 });

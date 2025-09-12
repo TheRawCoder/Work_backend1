@@ -15,79 +15,45 @@ export class UploadDataService {
     private readonly uploadDataModel: Model<UploadDataDocument>,
   ) { }
 
-  // --- New helper: validate records using mongoose validators (replacement for runValidators on insertMany)
+  // Validate records: must have ticketRefId, other fields can be empty
   private async validateRecords(records: any[]): Promise<any[]> {
     if (!records.length) return [];
     const validated: any[] = [];
 
     for (const rec of records) {
-      try {
-        const inst = new this.uploadDataModel(rec);
-        await inst.validate(); // throws if invalid
-        validated.push(rec);
-      } catch (err) {
-        console.log('[UPLOAD][VALIDATION SKIP] record skipped due to validation error:', err?.message || err);
-        // skip invalid record
+      // Only accept records with ticketRefId
+      if (!rec.ticketRefId || typeof rec.ticketRefId !== 'string' || rec.ticketRefId.trim() === '') {
+        console.log('[UPLOAD][VALIDATION SKIP] record skipped due to missing ticketRefId');
+        continue;
       }
+      // Ensure other fields are empty if not present
+      validated.push({
+        ticketRefId: rec.ticketRefId.trim(),
+        description: rec.description ?? '',
+        remark: rec.remark ?? '',
+        category: rec.category ?? '',
+        subCategory: rec.subCategory ?? '',
+        status: rec.status ?? 'Raised',
+      });
     }
-
     return validated;
   }
 
-  // --- Deduplicate:
-  // If ticketRefId present on incoming rows, dedupe by ticketRefId.
-  // Else fallback to description+category+subCategory.
-  private async filterDuplicates(records: any[]): Promise<any[]> {
-    if (!records.length) return [];
-
-    const candidatesById = records.filter(r => typeof r.ticketRefId === 'string' && r.ticketRefId.trim() !== '');
-    const candidatesByKey = records.filter(r =>
-      (typeof r.ticketRefId !== 'string' || r.ticketRefId.trim() === '') &&
-      typeof r.description === 'string' && r.description.trim() !== '' &&
-      typeof r.category === 'string' && r.category.trim() !== '' &&
-      typeof r.subCategory === 'string' && r.subCategory.trim() !== ''
-    );
-
-    // Build compact queries using $in for ids and a small $or for composite keys
-    const existingIdSet = new Set<string>();
-    const existingKeySet = new Set<string>();
-
-    if (candidatesById.length) {
-      const ids = candidatesById.map(r => r.ticketRefId.trim());
-      const existingById = await this.uploadDataModel.find({ ticketRefId: { $in: ids } })
-        .select('ticketRefId').lean();
-      existingById.forEach(e => existingIdSet.add(String(e.ticketRefId).trim()));
-    }
-
-    if (candidatesByKey.length) {
-      const keyOrQueries = candidatesByKey.map(r => ({
-        description: r.description,
-        category: r.category,
-        subCategory: r.subCategory,
-      }));
-      if (keyOrQueries.length) {
-        const existingByKey = await this.uploadDataModel.find({ $or: keyOrQueries })
-          .select('description category subCategory').lean();
-        existingByKey.forEach(e => {
-          const key = `${e.description}||${e.category}||${e.subCategory}`;
-          existingKeySet.add(key);
-        });
+  // Optimized bulk upsert records by ticketRefId
+  private async upsertRecords(records: any[]): Promise<number> {
+    if (!records.length) return 0;
+    const ops = records.map(rec => ({
+      updateOne: {
+        filter: { ticketRefId: rec.ticketRefId },
+        update: { $set: rec },
+        upsert: true
       }
-    }
-
-    const filtered = records.filter(r => {
-      const idKey = (r.ticketRefId && String(r.ticketRefId).trim()) ? String(r.ticketRefId).trim() : null;
-      const keyKey = (r.description || r.category || r.subCategory) ? `${r.description}||${r.category}||${r.subCategory}` : null;
-
-      if (idKey && existingIdSet.has(idKey)) return false;
-      if (keyKey && existingKeySet.has(keyKey)) return false;
-      return true;
-    });
-
-    return filtered;
+    }));
+    const result = await this.uploadDataModel.bulkWrite(ops, { ordered: false });
+    return (result.upsertedCount || 0) + (result.modifiedCount || 0);
   }
 
-  // --- Parse wrapper
+  // Parse wrapper
   async parseFileAndSave(filePath: string, fileSize: number): Promise<any> {
     try {
       const maxSize = 200 * 1024 * 1024; // 200MB
@@ -96,7 +62,6 @@ export class UploadDataService {
         throw new BadRequestException('File exceeds 200MB limit');
       }
 
-      // --- Parse CSV/Excel
       const ext = path.extname(filePath).toLowerCase();
       let result;
       if (ext === '.csv') result = await this.handleCsv(filePath);
@@ -114,13 +79,12 @@ export class UploadDataService {
     }
   }
 
-  // --- CSV handler (header normalization + ticketRefId mapping)
+  // CSV handler
   private async handleCsv(filePath: string): Promise<any> {
     return new Promise((resolve, reject) => {
       const batch: any[] = [];
-      const chunkSize = 2000;
+      const chunkSize = 5000; // You can increase this for more speed if memory allows
       let totalCount = 0;
-
       const limit = pLimit(5);
       const tasks: Promise<any>[] = [];
 
@@ -130,11 +94,6 @@ export class UploadDataService {
         .on('data', row => {
           rowIndex++;
 
-          // Log first parsed row (raw) to help debug header names
-          if (rowIndex === 1) {
-            console.log('[UPLOAD][DEBUG] first CSV row parsed (raw headers):', row);
-          }
-
           // Normalize keys: lowercase, remove spaces and underscores
           const normalized: any = {};
           for (const key of Object.keys(row)) {
@@ -142,11 +101,10 @@ export class UploadDataService {
             normalized[normKey] = row[key];
           }
 
-          // ********** FIX: compute rawTicketRef and only include if non-empty **********
           const rawTicketRef = (normalized['ticketrefid'] || normalized['ticketref'] || normalized['ticketid'] || '').toString().trim();
 
           const record: any = {
-            ...(rawTicketRef ? { ticketRefId: rawTicketRef } : {}),
+            ticketRefId: rawTicketRef,
             description: String(normalized['description'] || '').slice(0, 16000),
             remark: String(normalized['remark'] || normalized['remarks'] || '').slice(0, 16000),
             category: normalized['category'] || '',
@@ -154,31 +112,15 @@ export class UploadDataService {
             status: normalized['status'] || 'Raised',
           };
 
-          // Skip records missing required description
-          if (!record.description || record.description.trim() === '') {
-            console.log('[UPLOAD][SKIP] skipping CSV row', rowIndex, '- missing description');
-          } else {
-            batch.push(record);
-          }
+          batch.push(record);
 
           if (batch.length >= chunkSize) {
             const currentBatch = batch.splice(0, batch.length);
             tasks.push(limit(async () => {
-              const newRecords = await this.filterDuplicates(currentBatch);
-              if (newRecords.length) {
-                console.log('[UPLOAD][DEBUG] sample doc before insert:', newRecords[0]);
-
-                // ********** FIX: validateRecords then insertMany without runValidators **********
-                const validatedRecords = await this.validateRecords(newRecords);
-                if (validatedRecords.length) {
-                  const inserted = await this.uploadDataModel.insertMany(validatedRecords, { ordered: false });
-                  console.log('[UPLOAD] inserted chunk: requested=', validatedRecords.length, 'inserted=', inserted.length);
-                  totalCount += inserted.length;
-                } else {
-                  console.log('[UPLOAD] chunk skipped (all invalid after validation) requested=', newRecords.length);
-                }
-              } else {
-                console.log('[UPLOAD] chunk skipped (all duplicates) requested=', currentBatch.length);
+              const validatedRecords = await this.validateRecords(currentBatch);
+              if (validatedRecords.length) {
+                const insertedCount = await this.upsertRecords(validatedRecords);
+                totalCount += insertedCount;
               }
             }));
           }
@@ -187,28 +129,17 @@ export class UploadDataService {
           try {
             if (batch.length > 0) {
               tasks.push(limit(async () => {
-                const newRecords = await this.filterDuplicates(batch);
-                if (newRecords.length) {
-                  console.log('[UPLOAD][DEBUG] sample doc before final insert:', newRecords[0]);
-
-                  const validatedRecords = await this.validateRecords(newRecords);
-                  if (validatedRecords.length) {
-                    const inserted = await this.uploadDataModel.insertMany(validatedRecords, { ordered: false });
-                    console.log('[UPLOAD] inserted final chunk: requested=', validatedRecords.length, 'inserted=', inserted.length);
-                    totalCount += inserted.length;
-                  } else {
-                    console.log('[UPLOAD] final chunk skipped (all invalid after validation) requested=', newRecords.length);
-                  }
-                } else {
-                  console.log('[UPLOAD] final chunk skipped (all duplicates) requested=', batch.length);
+                const validatedRecords = await this.validateRecords(batch);
+                if (validatedRecords.length) {
+                  const insertedCount = await this.upsertRecords(validatedRecords);
+                  totalCount += insertedCount;
                 }
               }));
             }
             await Promise.all(tasks);
 
-            console.log('[UPLOAD] totalInserted=', totalCount);
             if (totalCount === 0) {
-              throw new BadRequestException('All records in the file already exist');
+              throw new BadRequestException('No valid records with ticketRefId found or all records already exist.');
             }
 
             resolve({ message: 'File uploaded successfully', totalRecords: totalCount });
@@ -220,11 +151,11 @@ export class UploadDataService {
     });
   }
 
-  // --- Excel handler (header normalization + ticketRefId mapping)
+  // Excel handler
   private async handleExcel(filePath: string): Promise<any> {
     const workbook = new ExcelJS.stream.xlsx.WorkbookReader(filePath, { entries: 'emit' });
     const batch: any[] = [];
-    const chunkSize = 2000;
+    const chunkSize = 5000; // You can increase this for more speed if memory allows
     let totalCount = 0;
     const limit = pLimit(5);
     const tasks: Promise<any>[] = [];
@@ -240,10 +171,7 @@ export class UploadDataService {
         rowNumber++;
         if (row.number === 1) {
           headers = (row.values as any[]).slice(1).map(v => v ? String(v).trim() : '');
-          // normalize headers for consistent keys
           normalizedHeaders = headers.map(h => h.toLowerCase().replace(/\s+/g, '').replace(/_/g, ''));
-          console.log(`[UPLOAD][DEBUG] excel sheet ${sheetIndex} headers (raw):`, headers.slice(0, 20));
-          console.log(`[UPLOAD][DEBUG] excel sheet ${sheetIndex} headers (normalized):`, normalizedHeaders.slice(0, 20));
           continue;
         }
 
@@ -253,15 +181,10 @@ export class UploadDataService {
           rowData[key] = val ? String(val).trim().slice(0, 16000) : '';
         });
 
-        if (rowNumber === 2) {
-          console.log(`[UPLOAD][DEBUG] excel sheet ${sheetIndex} first data row mapped:`, rowData);
-        }
-
-        // ********** FIX: compute rawTicketRef and only include when non-empty **********
         const rawTicketRef = (rowData['ticketrefid'] || rowData['ticketref'] || rowData['ticketid'] || '').toString().trim();
 
         const record: any = {
-          ...(rawTicketRef ? { ticketRefId: rawTicketRef } : {}),
+          ticketRefId: rawTicketRef,
           description: rowData['description'] || '',
           remark: rowData['remark'] || rowData['remarks'] || '',
           category: rowData['category'] || '',
@@ -269,29 +192,15 @@ export class UploadDataService {
           status: rowData['status'] || 'Raised',
         };
 
-        if (!record.description || record.description.trim() === '') {
-          console.log('[UPLOAD][SKIP] skipping excel row - missing description at row', rowNumber);
-        } else {
-          batch.push(record);
-        }
+        batch.push(record);
 
         if (batch.length >= chunkSize) {
           const currentBatch = batch.splice(0, batch.length);
           tasks.push(limit(async () => {
-            const newRecords = await this.filterDuplicates(currentBatch);
-            if (newRecords.length) {
-              console.log('[UPLOAD][DEBUG] sample doc before insert (excel):', newRecords[0]);
-
-              const validatedRecords = await this.validateRecords(newRecords);
-              if (validatedRecords.length) {
-                const inserted = await this.uploadDataModel.insertMany(validatedRecords, { ordered: false });
-                console.log('[UPLOAD] inserted chunk: requested=', validatedRecords.length, 'inserted=', inserted.length);
-                totalCount += inserted.length;
-              } else {
-                console.log('[UPLOAD] chunk skipped (all invalid after validation) requested=', newRecords.length);
-              }
-            } else {
-              console.log('[UPLOAD] chunk skipped (all duplicates) requested=', currentBatch.length);
+            const validatedRecords = await this.validateRecords(currentBatch);
+            if (validatedRecords.length) {
+              const insertedCount = await this.upsertRecords(validatedRecords);
+              totalCount += insertedCount;
             }
           }));
         }
@@ -300,28 +209,18 @@ export class UploadDataService {
 
     if (batch.length > 0) {
       tasks.push(limit(async () => {
-        const newRecords = await this.filterDuplicates(batch);
-        if (newRecords.length) {
-          console.log('[UPLOAD][DEBUG] sample doc before final insert (excel):', newRecords[0]);
-
-          const validatedRecords = await this.validateRecords(newRecords);
-          if (validatedRecords.length) {
-            const inserted = await this.uploadDataModel.insertMany(validatedRecords, { ordered: false });
-            console.log('[UPLOAD] inserted final chunk: requested=', validatedRecords.length, 'inserted=', inserted.length);
-            totalCount += inserted.length;
-          } else {
-            console.log('[UPLOAD] final chunk skipped (all invalid after validation) requested=', newRecords.length);
-          }
-        } else {
-          console.log('[UPLOAD] final chunk skipped (all duplicates) requested=', batch.length);
+        const validatedRecords = await this.validateRecords(batch);
+        if (validatedRecords.length) {
+          const insertedCount = await this.upsertRecords(validatedRecords);
+          totalCount += insertedCount;
         }
       }));
     }
 
     await Promise.all(tasks);
-    console.log('[UPLOAD] totalInserted=', totalCount);
+
     if (totalCount === 0) {
-      throw new BadRequestException('All records in the file already exist');
+      throw new BadRequestException('No valid records with ticketRefId found or all records already exist.');
     }
     return { message: 'File uploaded successfully', totalRecords: totalCount };
   }
@@ -394,5 +293,4 @@ export class UploadDataService {
     const result = await this.uploadDataModel.findByIdAndDelete(id);
     return !!result; // true if deleted, false if not found
   }
-
 }
