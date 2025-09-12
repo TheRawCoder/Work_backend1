@@ -30,4 +30,4 @@ export class UploadData {
 }
 
 export const UploadDataSchema = SchemaFactory.createForClass(UploadData);
-UploadDataSchema.index({ description: 1, category: 1, subCategory: 1 });
+
