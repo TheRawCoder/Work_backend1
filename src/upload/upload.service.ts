@@ -15,6 +15,25 @@ export class UploadDataService {
     private readonly uploadDataModel: Model<UploadDataDocument>,
   ) { }
 
+  // --- New helper: validate records using mongoose validators (replacement for runValidators on insertMany)
+  private async validateRecords(records: any[]): Promise<any[]> {
+    if (!records.length) return [];
+    const validated: any[] = [];
+
+    for (const rec of records) {
+      try {
+        const inst = new this.uploadDataModel(rec);
+        await inst.validate(); // throws if invalid
+        validated.push(rec);
+      } catch (err) {
+        console.log('[UPLOAD][VALIDATION SKIP] record skipped due to validation error:', err?.message || err);
+        // skip invalid record
+      }
+    }
+
+    return validated;
+  }
+
   // --- Deduplicate:
   // If ticketRefId present on incoming rows, dedupe by ticketRefId.
   // Else fallback to description+category+subCategory.
@@ -29,37 +48,36 @@ export class UploadDataService {
       typeof r.subCategory === 'string' && r.subCategory.trim() !== ''
     );
 
-    const queries: any[] = [];
+    // Build compact queries using $in for ids and a small $or for composite keys
+    const existingIdSet = new Set<string>();
+    const existingKeySet = new Set<string>();
 
     if (candidatesById.length) {
-      queries.push(...candidatesById.map(r => ({ ticketRefId: r.ticketRefId })));
+      const ids = candidatesById.map(r => r.ticketRefId.trim());
+      const existingById = await this.uploadDataModel.find({ ticketRefId: { $in: ids } })
+        .select('ticketRefId').lean();
+      existingById.forEach(e => existingIdSet.add(String(e.ticketRefId).trim()));
     }
+
     if (candidatesByKey.length) {
-      queries.push(...candidatesByKey.map(r => ({
+      const keyOrQueries = candidatesByKey.map(r => ({
         description: r.description,
         category: r.category,
         subCategory: r.subCategory,
-      })));
+      }));
+      if (keyOrQueries.length) {
+        const existingByKey = await this.uploadDataModel.find({ $or: keyOrQueries })
+          .select('description category subCategory').lean();
+        existingByKey.forEach(e => {
+          const key = `${e.description}||${e.category}||${e.subCategory}`;
+          existingKeySet.add(key);
+        });
+      }
     }
 
-    if (queries.length === 0) {
-      // Nothing to check (either rows missing dedupe keys) — allow inserts
-      return records;
-    }
-
-    const existing = await this.uploadDataModel.find({ $or: queries })
-      .select('ticketRefId description category subCategory')
-      .lean();
-
-    const existingIdSet = new Set(existing.filter(e => e.ticketRefId).map(e => `id::${e.ticketRefId}`));
-    const existingKeySet = new Set(existing
-      .filter(e => e.description || e.category || e.subCategory)
-      .map(e => `key::${e.description}||${e.category}||${e.subCategory}`));
-
-    // Keep record if neither its ticketRefId nor its description+category+subCategory exists
     const filtered = records.filter(r => {
-      const idKey = (r.ticketRefId && String(r.ticketRefId).trim()) ? `id::${String(r.ticketRefId).trim()}` : null;
-      const keyKey = (r.description || r.category || r.subCategory) ? `key::${r.description}||${r.category}||${r.subCategory}` : null;
+      const idKey = (r.ticketRefId && String(r.ticketRefId).trim()) ? String(r.ticketRefId).trim() : null;
+      const keyKey = (r.description || r.category || r.subCategory) ? `${r.description}||${r.category}||${r.subCategory}` : null;
 
       if (idKey && existingIdSet.has(idKey)) return false;
       if (keyKey && existingKeySet.has(keyKey)) return false;
@@ -69,7 +87,7 @@ export class UploadDataService {
     return filtered;
   }
 
-  // --- Upload CSV or Excel (file-hash checks removed)
+  // --- Parse wrapper
   async parseFileAndSave(filePath: string, fileSize: number): Promise<any> {
     try {
       const maxSize = 200 * 1024 * 1024; // 200MB
@@ -124,9 +142,11 @@ export class UploadDataService {
             normalized[normKey] = row[key];
           }
 
-          const record = {
-            // map ticketRefId from headers like "Ticket Ref ID" -> normalized "ticketrefid"
-            ticketRefId: (normalized['ticketrefid'] || normalized['ticketref'] || normalized['ticketid'] || '').toString().trim(),
+          // ********** FIX: compute rawTicketRef and only include if non-empty **********
+          const rawTicketRef = (normalized['ticketrefid'] || normalized['ticketref'] || normalized['ticketid'] || '').toString().trim();
+
+          const record: any = {
+            ...(rawTicketRef ? { ticketRefId: rawTicketRef } : {}),
             description: String(normalized['description'] || '').slice(0, 16000),
             remark: String(normalized['remark'] || normalized['remarks'] || '').slice(0, 16000),
             category: normalized['category'] || '',
@@ -134,16 +154,29 @@ export class UploadDataService {
             status: normalized['status'] || 'Raised',
           };
 
-          batch.push(record);
+          // Skip records missing required description
+          if (!record.description || record.description.trim() === '') {
+            console.log('[UPLOAD][SKIP] skipping CSV row', rowIndex, '- missing description');
+          } else {
+            batch.push(record);
+          }
 
           if (batch.length >= chunkSize) {
             const currentBatch = batch.splice(0, batch.length);
             tasks.push(limit(async () => {
               const newRecords = await this.filterDuplicates(currentBatch);
               if (newRecords.length) {
-                const inserted = await this.uploadDataModel.insertMany(newRecords, { ordered: false });
-                console.log('[UPLOAD] inserted chunk: requested=', newRecords.length, 'inserted=', inserted.length);
-                totalCount += inserted.length;
+                console.log('[UPLOAD][DEBUG] sample doc before insert:', newRecords[0]);
+
+                // ********** FIX: validateRecords then insertMany without runValidators **********
+                const validatedRecords = await this.validateRecords(newRecords);
+                if (validatedRecords.length) {
+                  const inserted = await this.uploadDataModel.insertMany(validatedRecords, { ordered: false });
+                  console.log('[UPLOAD] inserted chunk: requested=', validatedRecords.length, 'inserted=', inserted.length);
+                  totalCount += inserted.length;
+                } else {
+                  console.log('[UPLOAD] chunk skipped (all invalid after validation) requested=', newRecords.length);
+                }
               } else {
                 console.log('[UPLOAD] chunk skipped (all duplicates) requested=', currentBatch.length);
               }
@@ -156,9 +189,16 @@ export class UploadDataService {
               tasks.push(limit(async () => {
                 const newRecords = await this.filterDuplicates(batch);
                 if (newRecords.length) {
-                  const inserted = await this.uploadDataModel.insertMany(newRecords, { ordered: false });
-                  console.log('[UPLOAD] inserted final chunk: requested=', newRecords.length, 'inserted=', inserted.length);
-                  totalCount += inserted.length;
+                  console.log('[UPLOAD][DEBUG] sample doc before final insert:', newRecords[0]);
+
+                  const validatedRecords = await this.validateRecords(newRecords);
+                  if (validatedRecords.length) {
+                    const inserted = await this.uploadDataModel.insertMany(validatedRecords, { ordered: false });
+                    console.log('[UPLOAD] inserted final chunk: requested=', validatedRecords.length, 'inserted=', inserted.length);
+                    totalCount += inserted.length;
+                  } else {
+                    console.log('[UPLOAD] final chunk skipped (all invalid after validation) requested=', newRecords.length);
+                  }
                 } else {
                   console.log('[UPLOAD] final chunk skipped (all duplicates) requested=', batch.length);
                 }
@@ -217,9 +257,11 @@ export class UploadDataService {
           console.log(`[UPLOAD][DEBUG] excel sheet ${sheetIndex} first data row mapped:`, rowData);
         }
 
-        // Map to the expected record shape (use normalized keys)
+        // ********** FIX: compute rawTicketRef and only include when non-empty **********
+        const rawTicketRef = (rowData['ticketrefid'] || rowData['ticketref'] || rowData['ticketid'] || '').toString().trim();
+
         const record: any = {
-          ticketRefId: (rowData['ticketrefid'] || rowData['ticketref'] || rowData['ticketid'] || '').toString().trim(),
+          ...(rawTicketRef ? { ticketRefId: rawTicketRef } : {}),
           description: rowData['description'] || '',
           remark: rowData['remark'] || rowData['remarks'] || '',
           category: rowData['category'] || '',
@@ -227,16 +269,27 @@ export class UploadDataService {
           status: rowData['status'] || 'Raised',
         };
 
-        batch.push(record);
+        if (!record.description || record.description.trim() === '') {
+          console.log('[UPLOAD][SKIP] skipping excel row - missing description at row', rowNumber);
+        } else {
+          batch.push(record);
+        }
 
         if (batch.length >= chunkSize) {
           const currentBatch = batch.splice(0, batch.length);
           tasks.push(limit(async () => {
             const newRecords = await this.filterDuplicates(currentBatch);
             if (newRecords.length) {
-              const inserted = await this.uploadDataModel.insertMany(newRecords, { ordered: false });
-              console.log('[UPLOAD] inserted chunk: requested=', newRecords.length, 'inserted=', inserted.length);
-              totalCount += inserted.length;
+              console.log('[UPLOAD][DEBUG] sample doc before insert (excel):', newRecords[0]);
+
+              const validatedRecords = await this.validateRecords(newRecords);
+              if (validatedRecords.length) {
+                const inserted = await this.uploadDataModel.insertMany(validatedRecords, { ordered: false });
+                console.log('[UPLOAD] inserted chunk: requested=', validatedRecords.length, 'inserted=', inserted.length);
+                totalCount += inserted.length;
+              } else {
+                console.log('[UPLOAD] chunk skipped (all invalid after validation) requested=', newRecords.length);
+              }
             } else {
               console.log('[UPLOAD] chunk skipped (all duplicates) requested=', currentBatch.length);
             }
@@ -249,9 +302,16 @@ export class UploadDataService {
       tasks.push(limit(async () => {
         const newRecords = await this.filterDuplicates(batch);
         if (newRecords.length) {
-          const inserted = await this.uploadDataModel.insertMany(newRecords, { ordered: false });
-          console.log('[UPLOAD] inserted final chunk: requested=', newRecords.length, 'inserted=', inserted.length);
-          totalCount += inserted.length;
+          console.log('[UPLOAD][DEBUG] sample doc before final insert (excel):', newRecords[0]);
+
+          const validatedRecords = await this.validateRecords(newRecords);
+          if (validatedRecords.length) {
+            const inserted = await this.uploadDataModel.insertMany(validatedRecords, { ordered: false });
+            console.log('[UPLOAD] inserted final chunk: requested=', validatedRecords.length, 'inserted=', inserted.length);
+            totalCount += inserted.length;
+          } else {
+            console.log('[UPLOAD] final chunk skipped (all invalid after validation) requested=', newRecords.length);
+          }
         } else {
           console.log('[UPLOAD] final chunk skipped (all duplicates) requested=', batch.length);
         }
